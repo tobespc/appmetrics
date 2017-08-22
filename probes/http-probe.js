@@ -20,6 +20,21 @@ var util = require('util');
 var url = require('url');
 var am = require('../');
 
+var path = require('path');
+var programName = path.basename(process.argv[1]);
+
+
+const zipkin = require('zipkin');
+const {Request, Annotation} = require('zipkin');
+
+// In Node.js, the recommended context API to use is zipkin-context-cls.
+const CLSContext = require('zipkin-context-cls');
+const ctxImpl = new CLSContext(); // if you want to use CLS
+const xtxImpl = new zipkin.ExplicitContext(); // Alternative; if you want to pass around the context manually
+const {recorder} = require('../recorder');
+// instrument the client
+
+
 function HttpProbe() {
 	Probe.call(this, 'http');
 	this.config = {
@@ -29,12 +44,22 @@ function HttpProbe() {
 util.inherits(HttpProbe, Probe);
 
 HttpProbe.prototype.attach = function(name, target) {
+	const tracer = new zipkin.Tracer({
+	  ctxImpl,
+	  recorder: recorder, // For easy debugging. You probably want to use an actual implementation, like Kafka or Scribe.
+	  sampler: new zipkin.sampler.CountingSampler(0.01), // sample rate 0.01 will sample 1 % of all incoming requests
+	  traceId128Bit: true // to generate 128-bit trace IDs. 64-bit (false) is default
+	});
+
+	//tracer.setId(tracer.createChildId());
+	//const traceId = tracer.id;
+
 	var that = this;
 	if( name == 'http' ) {
 		if(target.__probeAttached__) return target;
 	    target.__probeAttached__ = true;
 	    var methods = ['on', 'addListener'];
-	    
+
 	    aspect.before(target.Server.prototype, methods,
 	      function(obj, methodName, args, probeData) {
 	        if(args[0] !== 'request') return;
@@ -46,11 +71,23 @@ HttpProbe.prototype.attach = function(name, target) {
 	            // Filter out urls where filter.to is ''
 	            var traceUrl = that.filterUrl(httpReq);
 	            if (traceUrl !== '') {
+
+						    const method = httpReq.method;
+
+								tracer.setId(tracer.createChildId());
+						    tracer.recordServiceName("TOBES service " + programName);
+						    tracer.recordRpc(method.toUpperCase());
+						    tracer.recordBinary('http.url', traceUrl);
+						    tracer.recordAnnotation(new Annotation.ServerReceived());
+
 	            	that.metricsProbeStart(probeData, httpReq.method, traceUrl);
 	            	that.requestProbeStart(probeData, httpReq.method, traceUrl);
 	                aspect.after(res, 'end', probeData, function(obj, methodName, args, probeData, ret) {
 	            		that.metricsProbeEnd(probeData, httpReq.method, traceUrl, res, httpReq);
 	            		that.requestProbeEnd(probeData, httpReq.method, traceUrl, res, httpReq);
+									Request.addZipkinHeaders(res, tracer.id);
+									tracer.recordBinary('http.status_code', res.statusCode.toString());
+									tracer.recordAnnotation(new Annotation.ServerSent());
 	            	});
 	            }
 	        });
@@ -77,7 +114,7 @@ HttpProbe.prototype.filterUrl = function(req) {
     var resultUrl = parse(req.url);
     var filters = this.config.filters;
     if (filters.length == 0) return resultUrl;
-    
+
     var identifier = req.method + ' ' + resultUrl;
     for (var i = 0; i < filters.length; ++i) {
         var filter = filters[i];
@@ -90,7 +127,7 @@ HttpProbe.prototype.filterUrl = function(req) {
 
 /*
  * Lightweight metrics probe for HTTP requests
- * 
+ *
  * These provide:
  * 		time:		time event started
  * 		method:		HTTP method, eg. GET, POST, etc
